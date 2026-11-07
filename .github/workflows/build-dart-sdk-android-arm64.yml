@@ -1,0 +1,590 @@
+name: build-dart-sdk-android-arm64
+
+# بناء Dart SDK بالإصدار 3.12.2 بالضبط لاستهداف Android arm64.
+# كل أمر هنا مُراجَع مقابل مصدر Dart 3.12.2 الفعلي (tools/build.py, tools/gn.py,
+# tools/utils.py, sdk/BUILD.gn, DEPS) — انظر التعليقات "VERIFIED" بجانب كل افتراض.
+#
+# مرحلتان:
+#   build  : البناء. ينتج أرشيفًا خامًا غير موثَّق (dart-sdk-raw) بعمر قصير + بيانات وصفية.
+#   verify : فك الأرشيف + فحص كل مكوّن مطلوب + تغليف + SHA256 + تقرير.
+#            لا يُنشر شيء "نهائي" إلا بعد نجاح كل الفحوص.
+# لإعادة التحقق دون إعادة البناء: مرّر رقم تشغيل سابق في reuse_run_id.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reuse_run_id:
+        description: "فارغ = بناء كامل. أو رقم تشغيل سابق لنفس الـ workflow نجحت فيه مرحلة build (لإعادة التحقق والتغليف فقط)"
+        required: false
+        default: ""
+        type: string
+      publish_release:
+        description: "نشر الملفات النهائية في GitHub Release (أسهل للتنزيل من الهاتف)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  DART_TAG: "3.12.2"
+  DART_REPO: "https://dart.googlesource.com/sdk.git"
+  # VERIFIED: tools/utils.py GetBuildConf => Mode + os.title() + arch.upper() = ReleaseAndroidARM64
+  #           BUILD_ROOT['linux'] = 'out'  ;  sdk_args.gni: dart_sdk_output = "dart-sdk"
+  OUT_NAME: "ReleaseAndroidARM64"
+  WORKFLOW_PATH: ".github/workflows/build-dart-sdk-android-arm64.yml"
+  RAW_ARTIFACT: "dart-sdk-raw"
+
+defaults:
+  run:
+    # الصيغة 'bash' الصريحة = bash --noprofile --norc -eo pipefail
+    shell: bash
+
+jobs:
+  # ===========================================================================
+  build:
+    if: ${{ inputs.reuse_run_id == '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: "1) تجهيز المساحة والأدوات"
+        run: |
+          WORK="$HOME/dartwork"
+          mkdir -p "$WORK/raw"
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          printf 'stage\tresult\ttime_utc\n' > "$WORK/build-stages.tsv"
+          echo "== المساحة قبل التنظيف =="; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          echo "== المساحة بعد التنظيف =="; df -h /
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd xz-utils pigz binutils git curl python3 file
+          git config --global advice.detachedHead false
+          printf 'prepare\tOK\t%s\n' "$(date -u +%FT%TZ)" >> "$WORK/build-stages.tsv"
+
+      - name: "2) depot_tools + مصدر Dart بالوسم المثبَّت"
+        run: |
+          cd "$WORK"
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$WORK/depot_tools" >> "$GITHUB_PATH"
+          echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
+          echo "DEPOT_TOOLS_METRICS=0" >> "$GITHUB_ENV"
+
+          git clone --branch "$DART_TAG" --depth 1 --no-tags "$DART_REPO" sdk
+          cd sdk
+
+          HEAD_SHA="$(git rev-parse HEAD)"
+          REMOTE_SHA="$(git ls-remote "$DART_REPO" "refs/tags/${DART_TAG}^{}" | cut -f1)"
+          [ -n "$REMOTE_SHA" ] || REMOTE_SHA="$(git ls-remote "$DART_REPO" "refs/tags/${DART_TAG}" | cut -f1)"
+          if [ -z "$REMOTE_SHA" ] || [ "$HEAD_SHA" != "$REMOTE_SHA" ]; then
+            echo "::error::الـ commit المسحوب ($HEAD_SHA) لا يطابق commit الوسم $DART_TAG ($REMOTE_SHA)"
+            exit 1
+          fi
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit غير صالح: $HEAD_SHA"; exit 1; }
+
+          # VERIFIED: tools/VERSION في 3.12.2 بصيغة "KEY VALUE" (مسافة واحدة، بلا '=')
+          get() { awk -v k="$1" '$1==k {print $2}' tools/VERSION; }
+          for pair in MAJOR=3 MINOR=12 PATCH=2 PRERELEASE=0 PRERELEASE_PATCH=0 CHANNEL=stable; do
+            k="${pair%%=*}"; want="${pair#*=}"; got="$(get "$k")"
+            if [ "$got" != "$want" ]; then
+              echo "::error::tools/VERSION: $k = '$got' والمتوقع '$want'"
+              cat tools/VERSION
+              exit 1
+            fi
+          done
+
+          echo "$HEAD_SHA" > "$WORK/raw/commit.txt"
+          echo "commit=$HEAD_SHA"
+          printf 'source\tOK\t%s\n' "$(date -u +%FT%TZ)" >> "$WORK/build-stages.tsv"
+
+      - name: "3) .gclient (يدويًا، بدون --custom-var) + gclient sync"
+        run: |
+          cd "$WORK"
+          # لم نعتمد على "gclient config --custom-var" لأن depot_tools لم يكن قابلًا للفحص
+          # قبل التشغيل. ملف .gclient هو الصيغة الأصلية المدعومة دائمًا:
+          #   managed=False  : gclient لا يلمس checkout الخاص بـ sdk (هو المسحوب بالوسم أعلاه)
+          #   custom_vars    : يفعّل download_android_deps المعرّف في DEPS (VERIFIED: DEPS سطر 72 = False افتراضيًا،
+          #                    وشرط تنزيل third_party/android_tools هو "download_android_deps")
+          cat > .gclient <<EOF
+          solutions = [
+            {
+              "name": "sdk",
+              "url": "$DART_REPO",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {"download_android_deps": True},
+            },
+          ]
+          EOF
+          cat .gclient
+
+          # تحقق من أن الملف يُقرأ كـ Python صالح وبالقيم المقصودة
+          python3 -I - <<'PY'
+          ns = {}
+          exec(open(".gclient").read(), ns)
+          s = ns["solutions"][0]
+          assert s["name"] == "sdk" and s["managed"] is False, s
+          assert s["custom_vars"] == {"download_android_deps": True}, s
+          print(".gclient OK")
+          PY
+
+          # تحقق من أن DEPS يعرّف المتغير والشرط فعلًا (وإلا فالإعداد بلا أثر)
+          grep -Eq '"download_android_deps": *False' sdk/DEPS || { echo "::error::DEPS لا يعرّف download_android_deps كما هو متوقع"; exit 1; }
+          grep -Eq '"condition": *"download_android_deps"' sdk/DEPS || { echo "::error::DEPS لا يربط android_tools بالشرط download_android_deps"; exit 1; }
+
+          gclient --version | tee "$WORK/gclient-version.txt"
+          gclient sync --no-history -j 8 2>&1 | tee "$WORK/sync.log"
+
+          echo "== المساحة بعد المزامنة =="; df -h /
+
+          # بعد المزامنة: لم يتغير checkout المصدر، ووصلت أدوات البناء فعلًا
+          [ "$(git -C sdk rev-parse HEAD)" = "$(cat raw/commit.txt)" ] || { echo "::error::تغيّر HEAD لمصدر sdk أثناء المزامنة"; exit 1; }
+          # VERIFIED: build/config/android/config.gni => android_ndk_root = //third_party/android_tools/ndk
+          #           و toolchain: $ndk/toolchains/llvm/prebuilt/linux-x86_64
+          NDK_CLANG="sdk/third_party/android_tools/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          [ -x "$NDK_CLANG" ] || { echo "::error::مفقود: $NDK_CLANG (لم تُنزَّل اعتماديات Android)"; find sdk/third_party/android_tools -maxdepth 3 2>/dev/null | head -30; exit 1; }
+          [ -x sdk/buildtools/ninja/ninja ] || { echo "::error::مفقود: buildtools/ninja/ninja"; exit 1; }
+          GN="$(find sdk/buildtools -maxdepth 2 -name gn -type f | head -1)"
+          [ -n "$GN" ] || { echo "::error::مفقود: gn في buildtools"; exit 1; }
+          printf 'gclient_sync\tOK\t%s\n' "$(date -u +%FT%TZ)" >> "$WORK/build-stages.tsv"
+
+      - name: "4) تسجيل إصدارات الأدوات (للتقرير)"
+        run: |
+          cd "$WORK"
+          NDK_ROOT="sdk/third_party/android_tools/ndk"
+          NDK_CLANG="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          GN="$(find sdk/buildtools -maxdepth 2 -name gn -type f | head -1)"
+          {
+            echo "runner: $(uname -a)"
+            echo "python3: $(python3 --version 2>&1)"
+            echo "git: $(git --version)"
+            echo "gclient: $(cat gclient-version.txt)"
+            echo "depot_tools commit: $(git -C depot_tools rev-parse HEAD)"
+            echo "dart tag: $DART_TAG"
+            echo "dart commit: $(cat raw/commit.txt)"
+            echo "DEPS sha256: $(sha256sum sdk/DEPS | cut -d' ' -f1)"
+            echo "NDK clang: $("$NDK_CLANG" --version 2>&1 | head -1)"
+            echo "NDK source.properties: $(tr '\n' ' ' < "$NDK_ROOT/source.properties" 2>/dev/null || echo n/a)"
+            echo "ninja: $(sdk/buildtools/ninja/ninja --version 2>&1)"
+            echo "gn: $("$GN" --version 2>&1)"
+          } | tee raw/build-info.txt
+          printf 'tool_versions\tOK\t%s\n' "$(date -u +%FT%TZ)" >> "$WORK/build-stages.tsv"
+
+      - name: "5) فحص مسبق لخيارات build.py"
+        run: |
+          cd "$WORK/sdk"
+          # VERIFIED في المصدر: tools/gn.py يعرّف --no-rbe (dest=rbe, store_false) و --mode/-m و --arch/-a و --os؛
+          # وtools/build.py يستعملها عبر gn_py.AddCommonGnOptionArgs / AddCommonConfigurationArgs.
+          # هذا الفحص يتأكد أن النسخة المسحوبة فعليًا ما زالت كذلك، ويفشل بدل حذف أي خيار بصمت.
+          python3 tools/build.py --help > "$WORK/build-help.txt" 2>&1 || true
+          for opt in '--no-rbe' '--mode' '--arch' '--os'; do
+            grep -q -- "$opt" "$WORK/build-help.txt" || { echo "::error::build.py لا يعرف $opt"; cat "$WORK/build-help.txt"; exit 1; }
+          done
+          grep -Eq 'android' "$WORK/build-help.txt" || { echo "::error::build.py لا يذكر android"; exit 1; }
+          python3 -I - <<'PY'
+          import re, sys
+          t = open("tools/gn.py").read()
+          assert "'--no-rbe'" in t and "dest='rbe'" in t, "--no-rbe definition changed"
+          m = re.search(r"AVAILABLE_ARCHS\s*=", t); assert m, "AVAILABLE_ARCHS missing"
+          print("gn.py options OK")
+          PY
+          # الشرط الفعلي لوجود هدف create_sdk
+          grep -q 'group("create_sdk")' sdk/BUILD.gn || { echo "::error::sdk/BUILD.gn لا يعرّف create_sdk"; exit 1; }
+          printf 'build_py_options\tOK\t%s\n' "$(date -u +%FT%TZ)" >> "$WORK/build-stages.tsv"
+
+      - name: "6) البناء: create_sdk لـ android arm64"
+        run: |
+          cd "$WORK/sdk"
+          # --no-rbe  => في gn.py: verify_sdk_hash=True و git_version=True (dart_version_git_info)،
+          #              لذلك يُكتب ملفا version و revision بقيمة git الحقيقية (VERIFIED: sdk/BUILD.gn write_*_file).
+          python3 tools/build.py --no-rbe --mode release --arch arm64 --os android create_sdk 2>&1 | tee "$WORK/build.log"
+
+          OUT="out/$OUT_NAME"
+          [ -d "$OUT/dart-sdk" ] || { echo "::error::لم يُنتَج $OUT/dart-sdk"; ls out || true; exit 1; }
+          # أثبت أن الإعداد المنفَّذ فعلًا هو المطلوب (من args.gn الذي كتبه gn)
+          ARGS="$OUT/args.gn"
+          [ -f "$ARGS" ] || { echo "::error::مفقود $ARGS"; exit 1; }
+          cp "$ARGS" "$WORK/raw/args.gn"
+          for pat in '^target_os *= *"android"' '^target_cpu *= *"arm64"' '^is_release *= *true' '^use_rbe *= *false' '^dart_version_git_info *= *true'; do
+            grep -Eq "$pat" "$ARGS" || { echo "::error::args.gn لا يحوي النمط: $pat"; cat "$ARGS"; exit 1; }
+          done
+          df -h /
+          printf 'build_create_sdk\tOK\t%s\n' "$(date -u +%FT%TZ)" >> "$WORK/build-stages.tsv"
+
+      - name: "7) تغليف الناتج الخام + بيانات وصفية للتحقق لاحقًا"
+        run: |
+          cd "$WORK/sdk/out/$OUT_NAME"
+          FILES=$(find dart-sdk \( -type f -o -type l \) | wc -l)
+          BYTES=$(du -sb dart-sdk | cut -f1)
+          [ "$FILES" -gt 100 ] || { echo "::error::عدد ملفات SDK ($FILES) أقل من المتوقع"; exit 1; }
+          tar -cf - dart-sdk | zstd -T0 -6 -o "$WORK/raw/raw-sdk.tar.zst"
+          zstd -t "$WORK/raw/raw-sdk.tar.zst"
+          (cd "$WORK/raw" && sha256sum raw-sdk.tar.zst > raw-sdk.tar.zst.sha256)
+          {
+            echo "DART_TAG=$DART_TAG"
+            echo "DART_COMMIT=$(cat "$WORK/raw/commit.txt")"
+            echo "OUT_NAME=$OUT_NAME"
+            echo "SDK_ENTRIES=$FILES"
+            echo "SDK_BYTES=$BYTES"
+            echo "BUILD_RUN_ID=${{ github.run_id }}"
+            echo "BUILD_WORKFLOW=$WORKFLOW_PATH"
+          } > "$WORK/raw/meta.env"
+          cat "$WORK/raw/meta.env"
+          cp "$WORK/build-stages.tsv" "$WORK/raw/build-stages.tsv"
+          printf 'pack_raw\tOK\t%s\n' "$(date -u +%FT%TZ)" >> "$WORK/raw/build-stages.tsv"
+          ls -l "$WORK/raw"
+
+      - name: "عرض آخر أسطر الخطأ الحقيقي (عند الفشل فقط)"
+        if: ${{ failure() }}
+        run: |
+          for f in "$WORK/build.log" "$WORK/sync.log"; do
+            [ -f "$f" ] || continue
+            echo "::group::آخر 120 سطرًا من $(basename "$f")"
+            tail -n 120 "$f"
+            echo "::endgroup::"
+            grep -n -m10 -E 'FAILED:|error:|ERROR' "$f" || true
+          done
+
+      - name: "رفع الناتج الخام (غير موثَّق)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RAW_ARTIFACT }}
+          path: ${{ env.WORK }}/raw/*
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: "رفع السجلات (دائمًا)"
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ${{ env.WORK }}/build.log
+            ${{ env.WORK }}/sync.log
+            ${{ env.WORK }}/build-help.txt
+            ${{ env.WORK }}/build-stages.tsv
+            ${{ env.WORK }}/gclient-version.txt
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ===========================================================================
+  verify:
+    needs: build
+    if: ${{ always() && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.reuse_run_id != '')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: "تجهيز الأدوات"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd xz-utils pigz binutils file git
+
+      - name: "التحقق من مصدر الناتج الخام (عند إعادة الاستخدام)"
+        if: ${{ inputs.reuse_run_id != '' }}
+        env:
+          REUSE: ${{ inputs.reuse_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$REUSE" =~ ^[0-9]+$ ]] || { echo "::error::reuse_run_id يجب أن يكون رقمًا"; exit 1; }
+          RUN_JSON="$(gh api "repos/${{ github.repository }}/actions/runs/$REUSE")" || { echo "::error::تعذّر جلب التشغيل $REUSE من هذا المستودع"; exit 1; }
+          python3 -I - "$RUN_JSON" "$WORKFLOW_PATH" <<'PY'
+          import json, sys
+          r = json.loads(sys.argv[1]); want = sys.argv[2]
+          errs = []
+          if r.get("path") != want: errs.append(f"مسار الـ workflow '{r.get('path')}' والمتوقع '{want}'")
+          if r.get("status") != "completed": errs.append(f"الحالة '{r.get('status')}' وليست completed")
+          if r.get("event") != "workflow_dispatch": errs.append(f"الحدث '{r.get('event')}'")
+          if errs:
+              print("::error::" + " | ".join(errs)); sys.exit(1)
+          print("run OK:", r.get("html_url"), "conclusion=", r.get("conclusion"))
+          PY
+          ART_JSON="$(gh api "repos/${{ github.repository }}/actions/runs/$REUSE/artifacts?per_page=100")"
+          python3 -I - "$ART_JSON" "$RAW_ARTIFACT" <<'PY'
+          import json, sys
+          a = json.loads(sys.argv[1])["artifacts"]; name = sys.argv[2]
+          m = [x for x in a if x["name"] == name]
+          if len(m) != 1: print(f"::error::يجب أن يحوي التشغيل artifact واحدًا باسم {name}؛ وُجد {len(m)}"); sys.exit(1)
+          if m[0].get("expired"): print("::error::انتهت صلاحية الـ artifact الخام (3 أيام)"); sys.exit(1)
+          print("artifact OK:", m[0]["name"], m[0]["size_in_bytes"], "bytes")
+          PY
+
+      - name: "تنزيل الناتج الخام (هذا التشغيل)"
+        if: ${{ inputs.reuse_run_id == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RAW_ARTIFACT }}
+          path: raw
+
+      - name: "تنزيل الناتج الخام (تشغيل سابق)"
+        if: ${{ inputs.reuse_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RAW_ARTIFACT }}
+          path: raw
+          run-id: ${{ inputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: "التحقق من الأصل: وسم Dart + سلامة الأرشيف + فك الأرشيف"
+        run: |
+          cd raw
+          for f in meta.env commit.txt raw-sdk.tar.zst raw-sdk.tar.zst.sha256 build-info.txt build-stages.tsv args.gn; do
+            [ -s "$f" ] || { echo "::error::الملف $f مفقود أو فارغ في الناتج الخام"; exit 1; }
+          done
+          sha256sum -c raw-sdk.tar.zst.sha256
+          # shellcheck disable=SC1091
+          . ./meta.env
+          [ "$DART_TAG" = "3.12.2" ] || { echo "::error::الناتج الخام لوسم '$DART_TAG' وليس 3.12.2"; exit 1; }
+          [ "$OUT_NAME" = "ReleaseAndroidARM64" ] || { echo "::error::OUT_NAME غير متوقع: $OUT_NAME"; exit 1; }
+          [ "$BUILD_WORKFLOW" = "$WORKFLOW_PATH" ] || { echo "::error::الناتج الخام من workflow آخر: $BUILD_WORKFLOW"; exit 1; }
+          [ "$DART_COMMIT" = "$(tr -d '[:space:]' < commit.txt)" ] || { echo "::error::commit.txt لا يطابق meta.env"; exit 1; }
+          REMOTE="$(git ls-remote "$DART_REPO" "refs/tags/${DART_TAG}^{}" | cut -f1)"
+          [ -n "$REMOTE" ] || REMOTE="$(git ls-remote "$DART_REPO" "refs/tags/${DART_TAG}" | cut -f1)"
+          [ -n "$REMOTE" ] && [ "$REMOTE" = "$DART_COMMIT" ] || { echo "::error::commit الناتج الخام ($DART_COMMIT) لا يطابق commit الوسم الرسمي ($REMOTE)"; exit 1; }
+          echo "origin OK: tag=$DART_TAG commit=$DART_COMMIT build_run=$BUILD_RUN_ID"
+
+          zstd -t raw-sdk.tar.zst
+          cd ..
+          mkdir -p sdkwork out
+          zstd -dc raw/raw-sdk.tar.zst | tar -x -C sdkwork
+          [ -d sdkwork/dart-sdk ] || { echo "::error::فك الأرشيف لم ينتج dart-sdk"; exit 1; }
+          ENTRIES=$(find sdkwork/dart-sdk \( -type f -o -type l \) | wc -l)
+          BYTES=$(du -sb sdkwork/dart-sdk | cut -f1)
+          echo "entries=$ENTRIES bytes=$BYTES (المتوقع: $SDK_ENTRIES / $SDK_BYTES)"
+          [ "$ENTRIES" = "$SDK_ENTRIES" ] || { echo "::error::عدد العناصر بعد الفك ($ENTRIES) لا يطابق وقت التغليف ($SDK_ENTRIES)"; exit 1; }
+          [ "$BYTES" = "$SDK_BYTES" ] || { echo "::error::الحجم بعد الفك ($BYTES) لا يطابق وقت التغليف ($SDK_BYTES)"; exit 1; }
+
+      - name: "الفحوص (أي فشل يوقف سير العمل)"
+        run: |
+          set +e   # نجمع كل الأخطاء ثم نفشل في النهاية؛ كل عملية أساسية تمر عبر must/bad أدناه
+          cd sdkwork/dart-sdk || { echo "::error::sdkwork/dart-sdk مفقود"; exit 1; }
+          SDK="$PWD"
+          COMMIT="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/raw/commit.txt")"
+          RES="$GITHUB_WORKSPACE/verify-results.md"
+          FAIL=0
+          printf '| الفحص | النتيجة | التفاصيل |\n|---|---|---|\n' > "$RES" || { echo "::error::تعذّر إنشاء $RES"; exit 1; }
+          ok()   { printf '| %s | ✅ | %s |\n' "$1" "$2" >> "$RES"; }
+          bad()  { printf '| %s | ❌ | %s |\n' "$1" "$2" >> "$RES"; FAIL=1; }
+          info() { printf '| %s | ℹ️ | %s |\n' "$1" "$2" >> "$RES"; }
+          # must "<اسم الفحص>" cmd... : ينفذ الأمر؛ فشله = ❌
+          must() { local n="$1"; shift; local out; out="$("$@" 2>&1)"; local rc=$?; if [ $rc -ne 0 ]; then bad "$n" "فشل الأمر (rc=$rc): $* : $out"; return 1; fi; return 0; }
+
+          # --- ملفات الإصدار. VERIFIED (sdk/BUILD.gn + tools/write_*_file.py + utils.py):
+          #   version  = "3.12.2\n"  (قناة stable بلا لاحقة)
+          #   revision = "<40 hex git rev-parse HEAD>\n"  (لأن --no-rbe => dart_version_git_info=true)
+          if [ -f version ]; then
+            v="$(tr -d '[:space:]' < version)"
+            [ "$v" = "3.12.2" ] && ok "ملف version" "$v" || bad "ملف version" "القيمة '$v' والمتوقع 3.12.2"
+          else bad "ملف version" "مفقود"; fi
+          if [ -f revision ]; then
+            r="$(tr -d '[:space:]' < revision)"
+            if [[ "$r" =~ ^[0-9a-f]{40}$ ]] && [ "$r" = "$COMMIT" ]; then ok "ملف revision" "$r (يطابق commit الوسم)"
+            else bad "ملف revision" "'$r' لا يطابق commit الوسم '$COMMIT'"; fi
+          else bad "ملف revision" "مفقود (مطلوب لأن البناء بـ --no-rbe يفعّل git_version)"; fi
+
+          # --- ملفات تنفيذية مطلوبة (VERIFIED: رأس sdk/BUILD.gn يحدد التخطيط) ---
+          for f in bin/dart bin/dartvm bin/dartaotruntime bin/utils/gen_snapshot; do
+            if [ -s "$f" ] && [ -x "$f" ]; then ok "$f" "موجود وقابل للتنفيذ ($(stat -c %s "$f") bytes)"
+            else bad "$f" "مفقود أو فارغ أو غير قابل للتنفيذ"; fi
+          done
+
+          # --- Snapshots المطلوبة (قائمة 3.12.2 غير المشروطة بـ ia32 / app-jit) ---
+          for f in analysis_server.dart.snapshot analysis_server_aot.dart.snapshot dart2js_aot.dart.snapshot \
+                   dart2wasm_product.snapshot dartdev_aot.dart.snapshot dartdevc_aot.dart.snapshot dds_aot.dart.snapshot \
+                   dart_tooling_daemon_aot.dart.snapshot frontend_server_aot.dart.snapshot gen_kernel_aot.dart.snapshot \
+                   kernel_worker_aot.dart.snapshot; do
+            p="bin/snapshots/$f"
+            [ -s "$p" ] && ok "$p" "$(stat -c %s "$p") bytes" || bad "$p" "مفقود أو فارغ"
+          done
+          for f in bin/snapshots/dart2bytecode.snapshot bin/snapshots/dart_mcp_server_aot.dart.snapshot bin/snapshots/kernel-service.dart.snapshot bin/snapshots/dart_runtime_service_vm_aot.snapshot; do
+            [ -s "$f" ] && info "$f" "موجود (اختياري)" || info "$f" "غير موجود (اختياري)"
+          done
+
+          # --- ملفات Kernel (.dill): موجودة وغير فارغة وبرقم Kernel السحري 90 ab cd ef ---
+          for f in vm_platform.dill vm_platform_strong.dill dart2js_platform.dill dart2js_server_platform.dill \
+                   ddc_outline.dill ddc_platform.dill dart2wasm_outline.dill dart2wasm_platform.dill \
+                   dart2wasm_js_compatibility_outline.dill dart2wasm_js_compatibility_platform.dill; do
+            p="lib/_internal/$f"
+            if [ ! -s "$p" ]; then bad "$p" "مفقود أو فارغ"; continue; fi
+            magic="$(head -c4 "$p" | od -An -tx1 | tr -d ' \n')"
+            [ "$magic" = "90abcdef" ] && ok "$p" "Kernel magic سليم ($(stat -c %s "$p") bytes)" || bad "$p" "ليس ملف Kernel (magic=$magic)"
+          done
+          [ -s lib/_internal/vm_platform_product.dill ] && info "vm_platform_product.dill" "موجود" || info "vm_platform_product.dill" "غير موجود (اختياري)"
+
+          # --- vm_platform_strong.dill: VERIFIED أن sdk/BUILD.gn (copy_vm_strong_dill_files) تنسخه من vm_platform.dill ---
+          S=lib/_internal/vm_platform_strong.dill; P=lib/_internal/vm_platform.dill
+          if [ -L "$S" ]; then bad "vm_platform_strong.dill" "رابط رمزي ($(readlink "$S")) — المتوقع ملف عادي منسوخ بواسطة البناء"
+          elif [ -f "$S" ] && [ -f "$P" ]; then
+            cmp -s "$S" "$P" && ok "vm_platform_strong.dill" "ملف عادي من ناتج البناء، مطابق بايتيًا لـ vm_platform.dill" || bad "vm_platform_strong.dill" "يختلف عن vm_platform.dill"
+          fi
+
+          # --- المكتبات والمجلدات الأساسية ---
+          for f in lib/libraries.json lib/core/core.dart lib/async/async.dart lib/io/io.dart include/dart_api.h; do
+            [ -s "$f" ] && ok "$f" "موجود" || bad "$f" "مفقود أو فارغ"
+          done
+          for d in lib/async lib/collection lib/convert lib/core lib/developer lib/io lib/isolate lib/math lib/typed_data lib/internal \
+                   bin/resources/dartdoc/resources bin/resources/dartdoc/templates; do
+            [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ] && ok "$d/" "موجود وغير فارغ" || bad "$d/" "مفقود أو فارغ"
+          done
+
+          # --- ELF: هل هي ثنائيات Android arm64 فعلًا؟ ---
+          for b in bin/dart bin/dartvm bin/dartaotruntime; do
+            [ -x "$b" ] || continue
+            H="$(readelf -hW "$b" 2>&1)"; L="$(readelf -lW "$b" 2>&1)"; D="$(readelf -dW "$b" 2>&1)"
+            if echo "$H" | grep -q 'Machine:.*AArch64' && echo "$H" | grep -q 'Class:.*ELF64' && echo "$H" | grep -q 'Type:.*DYN'; then
+              ok "$b : ELF" "ELF64 AArch64 من نوع DYN (PIE)"
+            else bad "$b : ELF" "ليس ELF64 AArch64 PIE"; fi
+            interp="$(echo "$L" | sed -n 's/.*Requesting program interpreter: \([^]]*\)\].*/\1/p')"
+            [ "$interp" = "/system/bin/linker64" ] && ok "$b : interpreter" "$interp (Android bionic)" || bad "$b : interpreter" "'$interp' والمتوقع /system/bin/linker64"
+            needed="$(echo "$D" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')"
+            if echo "$needed" | grep -Eq '\.so\.[0-9]'; then bad "$b : المكتبات" "اعتماد على مكتبات glibc: $needed"
+            else ok "$b : المكتبات المطلوبة" "$needed"; fi
+          done
+          if [ -x bin/utils/gen_snapshot ]; then
+            readelf -hW bin/utils/gen_snapshot 2>&1 | grep -q 'Machine:.*AArch64' && info "gen_snapshot : ELF" "AArch64" || info "gen_snapshot : ELF" "ليس AArch64 (قد يكون أداة مضيف؛ للعلم فقط)"
+          fi
+          # AOT snapshots: إن كانت ELF يجب أن تكون AArch64
+          for s in bin/snapshots/*_aot.dart.snapshot; do
+            [ -f "$s" ] || continue
+            if readelf -hW "$s" >/dev/null 2>&1; then
+              readelf -hW "$s" | grep -q 'Machine:.*AArch64' && ok "$s : ELF" "AArch64" || bad "$s : ELF" "ELF لكن ليس AArch64"
+            else info "$s" "ليس ELF قابلًا للقراءة (تنسيق AOT آخر)"; fi
+          done
+
+          # --- سلسلة الإصدار داخل الثنائيات. VERIFIED: runtime/vm/version_in.cc => "<ver> (<channel>) (<commit time>)" ---
+          VERSION_LITERAL=""
+          for b in bin/dartvm bin/dartaotruntime bin/dart; do
+            [ -f "$b" ] || continue
+            strings -a "$b" > "$RUNNER_TEMP/s.txt" 2>/dev/null
+            line="$(grep -m1 -F '3.12.2 (stable) (' "$RUNNER_TEMP/s.txt")"
+            if [ -n "$line" ]; then
+              ok "$b : سلسلة الإصدار" "$line"
+              [ -z "$VERSION_LITERAL" ] && VERSION_LITERAL="$line"
+            elif [ "$b" = "bin/dart" ]; then info "$b : سلسلة الإصدار" "غير موجودة في هذا الملف (قد يكون مشغِّلًا خفيفًا)"
+            else bad "$b : سلسلة الإصدار" "لا تحوي '3.12.2 (stable) ('"; fi
+          done
+          printf '%s\n' "$VERSION_LITERAL" > "$GITHUB_WORKSPACE/version-literal.txt"
+          [ -n "$VERSION_LITERAL" ] || bad "إثبات الإصدار" "لم تُستخرج سلسلة إصدار من أي ثنائي"
+
+          # --- الروابط الرمزية: نسبية وداخل الـ SDK ---
+          nl=0
+          while IFS= read -r l; do
+            nl=$((nl+1)); t="$(readlink "$l")"
+            case "$t" in
+              /*) bad "رابط رمزي $l" "هدف مطلق: $t" ;;
+              *) abs="$(realpath -m "$(dirname "$l")/$t")"
+                 case "$abs" in "$SDK"/*) ok "رابط رمزي $l" "-> $t" ;; *) bad "رابط رمزي $l" "يخرج من الـ SDK: $abs" ;; esac
+                 [ -e "$abs" ] || bad "رابط رمزي $l" "هدف غير موجود: $t" ;;
+            esac
+          done < <(find . -type l)
+          [ "$nl" -eq 0 ] && info "الروابط الرمزية" "لا توجد روابط رمزية في الناتج"
+
+          info "حجم SDK بعد فك الضغط" "$(du -sb . | cut -f1) bytes"
+
+          # --- قوائم الملفات (عمليات أساسية: فشلها = فشل التحقق) ---
+          cd "$GITHUB_WORKSPACE" || exit 1
+          (cd sdkwork/dart-sdk && find . -type f -print0 | sort -z | xargs -0 sha256sum) > manifest-sha256.txt || bad "manifest-sha256.txt" "فشل إنشاء القائمة"
+          (cd sdkwork/dart-sdk && find . -type f -printf '%s\t%p\n' | sort -nr) > manifest-sizes.txt || bad "manifest-sizes.txt" "فشل إنشاء القائمة"
+          [ -s manifest-sha256.txt ] && [ -s manifest-sizes.txt ] || bad "manifests" "قائمة فارغة"
+          nf=$(find sdkwork/dart-sdk -type f | wc -l); nm=$(wc -l < manifest-sha256.txt)
+          [ "$nf" = "$nm" ] && ok "manifest" "$nm ملفًا" || bad "manifest" "عدد الملفات $nf لا يطابق القائمة $nm"
+
+          cat "$RES" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::فشل فحص واحد على الأقل — النتائج أدناه"
+            grep '❌' "$RES"
+            exit 1
+          fi
+          echo "كل الفحوص نجحت"
+
+      - name: "التغليف و SHA256 (يتوقف عند أي فشل)"
+        run: |
+          cd sdkwork
+          NAME="dart-sdk-3.12.2-android-arm64"
+          tar --owner=0 --group=0 --numeric-owner -cf - dart-sdk | xz -9 -T0 > "../out/$NAME.tar.xz"
+          tar --owner=0 --group=0 --numeric-owner -cf - dart-sdk | pigz -9 > "../out/$NAME.tar.gz"
+          cd ../out
+          # إعادة فتح الأرشيفين للتأكد أنهما سليمان ويحويان نفس عدد العناصر
+          EXPECT=$(find ../sdkwork/dart-sdk \( -type f -o -type l -o -type d \) | wc -l)
+          for f in "$NAME.tar.xz" "$NAME.tar.gz"; do
+            [ -s "$f" ] || { echo "::error::$f فارغ"; exit 1; }
+            got=$(tar -tf "$f" | wc -l)
+            [ "$got" = "$EXPECT" ] || { echo "::error::$f يحوي $got عنصرًا والمتوقع $EXPECT"; exit 1; }
+            tar -tf "$f" | grep -qx 'dart-sdk/bin/dart' || { echo "::error::$f لا يحوي dart-sdk/bin/dart"; exit 1; }
+          done
+          sha256sum "$NAME.tar.xz" "$NAME.tar.gz" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l; cat SHA256SUMS
+
+      - name: "كتابة التقرير"
+        run: |
+          F='```'
+          NAME="dart-sdk-3.12.2-android-arm64"
+          XZ=$(stat -c %s "out/$NAME.tar.xz"); GZ=$(stat -c %s "out/$NAME.tar.gz")
+          RAW=$(du -sb sdkwork/dart-sdk | cut -f1)
+          LIT="$(cat version-literal.txt)"
+          [ -n "$LIT" ] || { echo "::error::لا توجد سلسلة إصدار للتقرير"; exit 1; }
+          {
+            echo "# تقرير بناء Dart SDK 3.12.2 لأندرويد arm64"
+            echo
+            echo "## إثبات الإصدار (استخراج ثابت من الثنائيات — لم يُنفَّذ dart على هذا الخادم)"
+            echo "$F"
+            echo "Dart SDK version: $LIT"
+            echo "ملف version = $(tr -d '[:space:]' < sdkwork/dart-sdk/version)"
+            echo "الهدف: ELF64 AArch64 / interpreter=/system/bin/linker64 (Android ARM64)"
+            echo "$F"
+            echo
+            echo "## المصدر والأدوات"
+            echo "$F"; cat raw/build-info.txt; echo "$F"
+            echo
+            echo "## إعدادات البناء الفعلية (args.gn)"
+            echo "$F"; cat raw/args.gn; echo "$F"
+            echo
+            echo "## مراحل البناء"
+            echo "| المرحلة | النتيجة | الوقت (UTC) |"; echo "|---|---|---|"
+            tail -n +2 raw/build-stages.tsv | awk -F'\t' '{printf "| %s | %s | %s |\n",$1,$2,$3}'
+            echo
+            echo "## نتائج الفحص"
+            cat verify-results.md
+            echo
+            echo "## الأحجام"
+            echo "- tar.xz: $XZ bytes ($(numfmt --to=iec "$XZ"))"
+            echo "- tar.gz: $GZ bytes ($(numfmt --to=iec "$GZ"))"
+            echo "- بعد فك الضغط: $RAW bytes ($(numfmt --to=iec "$RAW"))"
+            echo
+            echo "## SHA256"
+            echo "$F"; cat out/SHA256SUMS; echo "$F"
+            echo
+            echo "## ملاحظة صريحة"
+            echo "الـ runner x86_64 ولا ينفّذ ثنائيات Android arm64 (bionic)، فالإثبات هنا ثابت."
+            echo "التنفيذ الفعلي لـ dart --version يتم على الهاتف، ولا تُعتبر البوابة 1 ناجحة قبله."
+          } > REPORT.md || { echo "::error::فشل إنشاء REPORT.md"; exit 1; }
+          cat REPORT.md >> "$GITHUB_STEP_SUMMARY"
+          cp REPORT.md verify-results.md manifest-sha256.txt manifest-sizes.txt out/
+
+      - name: "رفع الناتج النهائي الموثَّق"
+        uses: actions/upload-artifact@v4
+        with:
+          name: dart-sdk-3.12.2-android-arm64-verified
+          path: out/*
+          retention-days: 90
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: "نشر GitHub Release"
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="dart-3.12.2-android-arm64-run${{ github.run_number }}-${{ github.run_attempt }}"
+          gh release create "$TAG" out/* \
+            --repo "${{ github.repository }}" \
+            --title "Dart SDK 3.12.2 (Android arm64) - run ${{ github.run_number }}" \
+            --notes-file out/REPORT.md \
+            --prerelease
