@@ -437,23 +437,23 @@ jobs:
           for b in bin/dart bin/dartvm bin/dartaotruntime; do
             [ -x "$b" ] || continue
             H="$(readelf -hW "$b" 2>&1)"; L="$(readelf -lW "$b" 2>&1)"; D="$(readelf -dW "$b" 2>&1)"
-            if echo "$H" | grep -q 'Machine:.*AArch64' && echo "$H" | grep -q 'Class:.*ELF64' && echo "$H" | grep -q 'Type:.*DYN'; then
+            if grep -q 'Machine:.*AArch64' <<<"$H" && grep -q 'Class:.*ELF64' <<<"$H" && grep -q 'Type:.*DYN' <<<"$H"; then
               ok "$b : ELF" "ELF64 AArch64 من نوع DYN (PIE)"
             else bad "$b : ELF" "ليس ELF64 AArch64 PIE"; fi
             interp="$(echo "$L" | sed -n 's/.*Requesting program interpreter: \([^]]*\)\].*/\1/p')"
             [ "$interp" = "/system/bin/linker64" ] && ok "$b : interpreter" "$interp (Android bionic)" || bad "$b : interpreter" "'$interp' والمتوقع /system/bin/linker64"
             needed="$(echo "$D" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')"
-            if echo "$needed" | grep -Eq '\.so\.[0-9]'; then bad "$b : المكتبات" "اعتماد على مكتبات glibc: $needed"
+            if grep -Eq '\.so\.[0-9]' <<<"$needed"; then bad "$b : المكتبات" "اعتماد على مكتبات glibc: $needed"
             else ok "$b : المكتبات المطلوبة" "$needed"; fi
           done
           if [ -x bin/utils/gen_snapshot ]; then
-            readelf -hW bin/utils/gen_snapshot 2>&1 | grep -q 'Machine:.*AArch64' && info "gen_snapshot : ELF" "AArch64" || info "gen_snapshot : ELF" "ليس AArch64 (قد يكون أداة مضيف؛ للعلم فقط)"
+            GH="$(readelf -hW bin/utils/gen_snapshot 2>&1)"; grep -q 'Machine:.*AArch64' <<<"$GH" && info "gen_snapshot : ELF" "AArch64" || info "gen_snapshot : ELF" "ليس AArch64 (قد يكون أداة مضيف؛ للعلم فقط)"
           fi
           # AOT snapshots: إن كانت ELF يجب أن تكون AArch64
           for s in bin/snapshots/*_aot.dart.snapshot; do
             [ -f "$s" ] || continue
-            if readelf -hW "$s" >/dev/null 2>&1; then
-              readelf -hW "$s" | grep -q 'Machine:.*AArch64' && ok "$s : ELF" "AArch64" || bad "$s : ELF" "ELF لكن ليس AArch64"
+            if SH="$(readelf -hW "$s" 2>/dev/null)"; then
+              grep -q 'Machine:.*AArch64' <<<"$SH" && ok "$s : ELF" "AArch64" || bad "$s : ELF" "ELF لكن ليس AArch64"
             else info "$s" "ليس ELF قابلًا للقراءة (تنسيق AOT آخر)"; fi
           done
 
@@ -505,22 +505,69 @@ jobs:
 
       - name: "التغليف و SHA256 (يتوقف عند أي فشل)"
         run: |
-          cd sdkwork
+          # سبب الفشل السابق (مُعاد إنتاجه محليًا): الفحص `tar -tf | grep -q` مع pipefail.
+          # grep -q يخرج عند أول تطابق فيُغلق الأنبوب، فتفشل tar بـ "stdout: write error" (EPIPE)
+          # ويصير رمز الخط الأنبوبي غير صفري رغم أن الأرشيف سليم. الحل: لا grep -q بعد أنبوب أبدًا؛
+          # نكتب القائمة في ملف ثم نبحث فيه.
+          set -euo pipefail
           NAME="dart-sdk-3.12.2-android-arm64"
-          tar --owner=0 --group=0 --numeric-owner -cf - dart-sdk | xz -9 -T0 > "../out/$NAME.tar.xz"
-          tar --owner=0 --group=0 --numeric-owner -cf - dart-sdk | pigz -9 > "../out/$NAME.tar.gz"
-          cd ../out
-          # إعادة فتح الأرشيفين للتأكد أنهما سليمان ويحويان نفس عدد العناصر
-          EXPECT=$(find ../sdkwork/dart-sdk \( -type f -o -type l -o -type d \) | wc -l)
-          for f in "$NAME.tar.xz" "$NAME.tar.gz"; do
-            [ -s "$f" ] || { echo "::error::$f فارغ"; exit 1; }
-            got=$(tar -tf "$f" | wc -l)
-            [ "$got" = "$EXPECT" ] || { echo "::error::$f يحوي $got عنصرًا والمتوقع $EXPECT"; exit 1; }
-            tar -tf "$f" | grep -qx 'dart-sdk/bin/dart' || { echo "::error::$f لا يحوي dart-sdk/bin/dart"; exit 1; }
-          done
+          WS="$GITHUB_WORKSPACE"
+          SRC="$WS/sdkwork/dart-sdk"
+          OUT="$WS/out"
+          TMP="$RUNNER_TEMP/pack"
+          mkdir -p "$OUT" "$TMP"
+          [ -x "$SRC/bin/dart" ] || { echo "::error::$SRC/bin/dart مفقود قبل التغليف"; exit 1; }
+
+          RAW=$(du -sb "$SRC" | cut -f1)
+          EXPECT=$(find "$SRC" \( -type f -o -type l -o -type d \) | wc -l)
+          echo "== المساحة والذاكرة قبل التغليف =="; df -h "$WS"; free -m
+          AVAIL=$(df --output=avail -B1 "$WS" | tail -n1 | tr -d ' ')
+          NEED=$((RAW * 2))
+          echo "حجم SDK=$RAW ، المتاح=$AVAIL ، المطلوب (متحفظ)=$NEED ، عناصر الأرشيف المتوقعة=$EXPECT"
+          [ "$AVAIL" -ge "$NEED" ] || { echo "::error::المساحة المتاحة ($AVAIL) أقل من المطلوب ($NEED)"; exit 1; }
+
+          # الأرشفة: أسماء مؤقتة (.partial) خارج قائمة الرفع حتى اجتياز كل الفحوص
+          XZ_PART="$OUT/$NAME.tar.xz.partial"
+          GZ_PART="$OUT/$NAME.tar.gz.partial"
+          # xz -T1 -3: خيط واحد وإعداد خفيف (~ عشرات MiB) بدل -9 -T0 الذي يستهلك أكثر من 2GiB
+          tar -C "$WS/sdkwork" --owner=0 --group=0 --numeric-owner -cf - dart-sdk | xz -T1 -3 -c > "$XZ_PART"
+          tar -C "$WS/sdkwork" --owner=0 --group=0 --numeric-owner -cf - dart-sdk | gzip -6 -n -c > "$GZ_PART"
+          echo "== المساحة بعد التغليف =="; df -h "$WS"; ls -l "$OUT"
+
+          # سلامة الضغط
+          xz -t "$XZ_PART"
+          gzip -t "$GZ_PART"
+
+          # فحص المحتوى (القائمة تُكتب في ملف، لا أنابيب مع grep -q)
+          check_listing() {   # $1=ملف أرشيف  $2=J|z
+            local p="$1" fl="$2" lst="$TMP/$(basename "$1").list"
+            [ -s "$p" ] || { echo "::error::$p فارغ"; return 1; }
+            tar "-t${fl}f" "$p" > "$lst"
+            local got; got=$(wc -l < "$lst")
+            [ "$got" = "$EXPECT" ] || { echo "::error::$p يحوي $got عنصرًا والمتوقع $EXPECT"; return 1; }
+            local req
+            for req in dart-sdk/bin/dart dart-sdk/bin/dartvm dart-sdk/bin/dartaotruntime \
+                       dart-sdk/bin/snapshots/frontend_server_aot.dart.snapshot \
+                       dart-sdk/lib/_internal/vm_platform.dill dart-sdk/lib/_internal/vm_platform_strong.dill \
+                       dart-sdk/version dart-sdk/revision; do
+              grep -qxF "$req" "$lst" || { echo "::error::$p لا يحوي $req"; return 1; }
+            done
+            local v; v="$(tar "-x${fl}Of" "$p" dart-sdk/version | tr -d '[:space:]')"
+            [ "$v" = "3.12.2" ] || { echo "::error::version داخل $p = '$v'"; return 1; }
+            echo "OK: $(basename "$p") — $got عنصرًا، version=$v"
+          }
+          check_listing "$XZ_PART" J
+          check_listing "$GZ_PART" z
+
+          # الاعتماد: إعادة التسمية بعد النجاح فقط، ثم SHA256 (بعد التحقق وليس قبله)
+          mv "$XZ_PART" "$OUT/$NAME.tar.xz"
+          mv "$GZ_PART" "$OUT/$NAME.tar.gz"
+          cd "$OUT"
           sha256sum "$NAME.tar.xz" "$NAME.tar.gz" > SHA256SUMS
           sha256sum -c SHA256SUMS
+          xz -t "$NAME.tar.xz"
           ls -l; cat SHA256SUMS
+          df -h "$WS"
 
       - name: "كتابة التقرير"
         run: |
