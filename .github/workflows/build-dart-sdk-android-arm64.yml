@@ -530,8 +530,11 @@ jobs:
           XZ_PART="$OUT/$NAME.tar.xz.partial"
           GZ_PART="$OUT/$NAME.tar.gz.partial"
           # xz -T1 -3: خيط واحد وإعداد خفيف (~ عشرات MiB) بدل -9 -T0 الذي يستهلك أكثر من 2GiB
-          tar -C "$WS/sdkwork" --owner=0 --group=0 --numeric-owner -cf - dart-sdk | xz -T1 -3 -c > "$XZ_PART"
-          tar -C "$WS/sdkwork" --owner=0 --group=0 --numeric-owner -cf - dart-sdk | gzip -6 -n -c > "$GZ_PART"
+          # --hard-dereference: sdk/BUILD.gn ينسخ vm_platform_strong.dill بـ hard link من vm_platform.dill؛
+          # الأرشيف العادي يحفظه كـ hard link فيفشل فك الضغط على أندرويد (Permission denied عند ln)
+          # لذلك تُخزَّن كل الروابط الصلبة كملفات عادية مستقلة.
+          tar -C "$WS/sdkwork" --hard-dereference --owner=0 --group=0 --numeric-owner -cf - dart-sdk | xz -T1 -3 -c > "$XZ_PART"
+          tar -C "$WS/sdkwork" --hard-dereference --owner=0 --group=0 --numeric-owner -cf - dart-sdk | gzip -6 -n -c > "$GZ_PART"
           echo "== المساحة بعد التغليف =="; df -h "$WS"; ls -l "$OUT"
 
           # سلامة الضغط
@@ -545,6 +548,12 @@ jobs:
             tar "-t${fl}f" "$p" > "$lst"
             local got; got=$(wc -l < "$lst")
             [ "$got" = "$EXPECT" ] || { echo "::error::$p يحوي $got عنصرًا والمتوقع $EXPECT"; return 1; }
+            # لا روابط صلبة في الأرشيف (فك الضغط على أندرويد يفشل عليها)
+            local vl="$TMP/$(basename "$p").verbose"
+            tar "-t${fl}vf" "$p" > "$vl"
+            if grep -q ' link to ' "$vl"; then
+              echo "::error::$p يحوي روابط صلبة:"; grep ' link to ' "$vl" | head; return 1
+            fi
             local req
             for req in dart-sdk/bin/dart dart-sdk/bin/dartvm dart-sdk/bin/dartaotruntime \
                        dart-sdk/bin/snapshots/frontend_server_aot.dart.snapshot \
